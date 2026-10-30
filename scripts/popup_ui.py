@@ -162,6 +162,11 @@ def show(card):
             cv.create_text(mid, px(32), text=txt, font=F(8, "bold"), fill=tc)
         cv.create_text(mid, px(60), text=str(h["h"]), font=F(8), fill=c["muted"])
 
+    if card.get("warn"):
+        warn = tk.Frame(card_f, bg=c["bad_bg"], padx=px(10), pady=px(6))
+        warn.pack(fill="x", pady=(px(10), 0))
+        tk.Label(warn, text="⚠ " + card["warn"], font=F(9, "bold"), bg=c["bad_bg"], fg=c["bad_fg"],
+                 wraplength=W - px(20), justify="left").pack(anchor="w")
     tk.Label(card_f, text=card["tail"], font=F(9), bg=c["bg"], fg=c["fg"],
              wraplength=W, justify="left").pack(anchor="w", pady=(px(10), 0))
     tk.Label(card_f, text="骑完跟 Claude 说一声「今天骑车了」", font=F(8), bg=c["bg"],

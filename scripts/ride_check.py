@@ -159,10 +159,17 @@ def judge_day(day, hours, cfg):
         return {"ok": False, "reason": "、".join(reasons) or "好天气时段太短", "summary": summary}
     w = seg[best[0]:best[1]]
     wpm = [x["pm"] for x in w if x["pm"] is not None]
+    # 好时段一结束就下雨的话要提醒：别骑远了回不来
+    end = w[-1]["t"] + dt.timedelta(hours=1)
+    after = [x for x in hours if end <= x["t"] < end + dt.timedelta(hours=3)]
+    wet = [x for x in after if x["pp"] > cfg["rain_prob_max"] or x["mm"] > cfg["rain_mm_max"]]
+    warn = (f"{wet[0]['t'].hour}点后要下雨（降水概率升到{max(x['pp'] for x in after)}%），"
+            f"{end.hour}点前回来") if wet else None
     return {"ok": True, "summary": summary,
             "window": f"{w[0]['t'].hour}:00–{w[-1]['t'].hour + 1}:00",
             "detail": f"体感{min(x['feel'] for x in w):.0f}~{max(x['feel'] for x in w):.0f}° "
-                      f"风{max(x['wind'] for x in w):.0f}km/h",
+                      f"风{max(x['wind'] for x in w):.0f}km/h" + (f"，⚠ {warn}" if warn else ""),
+            "warn": warn,
             # 下面这些给弹窗画图用
             "feel": f"{min(x['feel'] for x in w):.0f}~{max(x['feel'] for x in w):.0f}°",
             "wind": f"{max(x['wind'] for x in w):.0f}",
@@ -303,6 +310,7 @@ def cmd_notify(args):
         "sub": f"{cfg['city']} · {day.month}月{day.day}日 周{WEEKDAY[day.weekday()]}",
         "window": j["window"], "feel": j["feel"], "wind": j["wind"], "pp": j["pp"], "pm": j["pm"],
         "hours": j["hours"], "best": j["best"], "tail": tail, "day": day.isoformat(),
+        "warn": j["warn"],
     })
     if not preview:
         log(f"已提醒：{rel} {j['window']} {j['detail']}")
