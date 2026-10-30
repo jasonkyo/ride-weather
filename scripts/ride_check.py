@@ -3,6 +3,8 @@
 用法：
   ride_check.py setup <城市>        设置城市（自动查坐标和时区），如 setup 西安
   ride_check.py notify            每晚定时任务跑：本周没骑 + 明天适合 → 弹窗
+  ride_check.py notify --preview  不管骑没骑，弹一下看效果
+  ride_check.py skip              这周不骑了，本周不再提醒
   ride_check.py week              打印今天起 7 天每天能不能骑
   ride_check.py log [日期] [备注]  记一次骑行（日期默认今天，格式 2026-10-30）
   ride_check.py status            本周骑了没、连续达标周数、最近记录
@@ -29,6 +31,7 @@ DIR = os.environ.get("RIDE_WEATHER_HOME") or os.path.join(os.path.expanduser("~"
 RIDES = os.path.join(DIR, "rides.json")
 LOG = os.path.join(DIR, "ride_check.log")
 CONFIG = os.path.join(DIR, "config.json")
+SKIPS = os.path.join(DIR, "skips.json")
 
 DEFAULT_CONFIG = {
     "city": None, "lat": None, "lon": None,
@@ -155,10 +158,18 @@ def judge_day(day, hours, cfg):
         reasons = sorted({b for p in probs for b in p})
         return {"ok": False, "reason": "、".join(reasons) or "好天气时段太短", "summary": summary}
     w = seg[best[0]:best[1]]
+    wpm = [x["pm"] for x in w if x["pm"] is not None]
     return {"ok": True, "summary": summary,
             "window": f"{w[0]['t'].hour}:00–{w[-1]['t'].hour + 1}:00",
             "detail": f"体感{min(x['feel'] for x in w):.0f}~{max(x['feel'] for x in w):.0f}° "
-                      f"风{max(x['wind'] for x in w):.0f}km/h"}
+                      f"风{max(x['wind'] for x in w):.0f}km/h",
+            # 下面这些给弹窗画图用
+            "feel": f"{min(x['feel'] for x in w):.0f}~{max(x['feel'] for x in w):.0f}°",
+            "wind": f"{max(x['wind'] for x in w):.0f}",
+            "pp": max(x["pp"] for x in w),
+            "pm": f"{max(wpm):.0f}" if wpm else None,
+            "best": list(best),
+            "hours": [{"h": x["t"].hour, "feel": x["feel"], "bad": p} for x, p in zip(seg, probs)]}
 
 
 def day_label(d, today):
@@ -166,9 +177,19 @@ def day_label(d, today):
     return f"{d:%m-%d} 周{WEEKDAY[d.weekday()]}" + (f"({rel})" if rel else "")
 
 
-def popup(title, body):
-    """弹窗提醒。Windows 用置顶 MessageBox（PowerShell toast 常被系统静默丢弃），
-    macOS 用 osascript，Linux 用 notify-send。都在单独进程里弹，不卡主脚本。"""
+def popup(card):
+    """弹提醒卡片（popup_ui.py，tkinter），在单独进程里弹，不卡主脚本。"""
+    exe = sys.executable
+    if platform.system() == "Windows":
+        w = os.path.join(os.path.dirname(exe), "pythonw.exe")
+        exe = w if os.path.exists(w) else exe
+    ui = os.path.join(os.path.dirname(os.path.abspath(__file__)), "popup_ui.py")
+    subprocess.Popen([exe, ui, json.dumps(card, ensure_ascii=False)])
+
+
+def plain_popup(title, body):
+    """没有 tkinter 时的退路。Windows 用置顶 MessageBox（PowerShell toast 常被系统静默丢弃），
+    macOS 用 osascript，Linux 用 notify-send。"""
     system = platform.system()
     if system == "Windows":
         exe = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
@@ -217,35 +238,74 @@ def cmd_week(args):
         print(f"{day_label(d, today)}  {mark}   [{j.get('summary', '')}]")
 
 
+def load_skips():
+    if not os.path.exists(SKIPS):
+        return []
+    with open(SKIPS, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def cmd_skip(args):
+    """这周不骑了，本周不再提醒。参数可给本周任意一天，默认明天所在的周。"""
+    d = dt.date.fromisoformat(args[0]) if args else dt.date.today() + dt.timedelta(days=1)
+    ws = week_start(d).isoformat()
+    skips = sorted(set(load_skips()) | {ws})
+    save_json(SKIPS, skips)
+    print(f"{ws} 这周不再提醒")
+
+
 def cmd_notify(args):
+    """--preview：不管本周骑没骑，弹一下看效果（明天不适合就挑 7 天内第一个好天）。"""
+    preview = "--preview" in args
     cfg = load_config()
-    tomorrow = dt.date.today() + dt.timedelta(days=1)
-    if rode_in_week(load_rides(), tomorrow):
-        log("本周已骑，不提醒")
-        return
+    today = dt.date.today()
+    tomorrow = today + dt.timedelta(days=1)
+    if not preview:
+        if rode_in_week(load_rides(), tomorrow):
+            log("本周已骑，不提醒")
+            return
+        if week_start(tomorrow).isoformat() in load_skips():
+            log("这周说了不骑，不提醒")
+            return
     hours = fetch_forecast(cfg)
-    j = judge_day(tomorrow, hours, cfg)
+    day, j = tomorrow, judge_day(tomorrow, hours, cfg)
     if not j["ok"]:
-        log(f"明天不适合：{j['reason']}")
-        return
+        if not preview:
+            log(f"明天不适合：{j['reason']}")
+            return
+        for i in range(7):
+            day = today + dt.timedelta(days=i)
+            j = judge_day(day, hours, cfg)
+            if j["ok"]:
+                break
+        else:
+            print("7 天内都没有适合骑车的天")
+            return
+    rel = {0: "今天", 1: "明天", 2: "后天"}.get((day - today).days, f"周{WEEKDAY[day.weekday()]}")
     others = []
-    d = tomorrow + dt.timedelta(days=1)
-    while week_start(d) == week_start(tomorrow):
+    d = day + dt.timedelta(days=1)
+    while week_start(d) == week_start(day):
         jj = judge_day(d, hours, cfg)
         if jj["ok"]:
             others.append(f"周{WEEKDAY[d.weekday()]} {jj['window']}")
         d += dt.timedelta(days=1)
-    if tomorrow.weekday() == 6:
-        tail = "明天是本周最后一天，这周还没骑！"
+    if day.weekday() == 6:
+        tail = f"{rel}是本周最后一天，这周还没骑！"
     elif others:
         tail = "本周后面也行：" + "、".join(others)
     else:
-        tail = "本周后面天气都不太行，就明天吧"
-    body = (f"{cfg['city']} 明天 周{WEEKDAY[tomorrow.weekday()]} {j['window']} 适合骑车\n"
+        tail = f"本周后面天气都不太行，就{rel}吧"
+    body = (f"{cfg['city']} {rel} 周{WEEKDAY[day.weekday()]} {j['window']} 适合骑车\n"
             f"{j['detail']}（全天 {j['summary']}）\n\n{tail}\n\n"
             "骑完跟 Claude 说一声「今天骑车了」")
-    popup("🚲 明天骑车吗", body)
-    log(f"已提醒：明天 {j['window']} {j['detail']}")
+    popup({
+        "title": f"{rel}适合骑车", "body": body, "rel": rel,
+        "sub": f"{cfg['city']} · {day.month}月{day.day}日 周{WEEKDAY[day.weekday()]}",
+        "window": j["window"], "feel": j["feel"], "wind": j["wind"], "pp": j["pp"], "pm": j["pm"],
+        "hours": j["hours"], "best": j["best"], "tail": tail, "day": day.isoformat(),
+    })
+    if not preview:
+        log(f"已提醒：{rel} {j['window']} {j['detail']}")
 
 
 def cmd_log(args):
@@ -277,7 +337,7 @@ def cmd_status(args):
 if __name__ == "__main__":
     a = sys.argv[1:] or ["week"]
     cmds = {"setup": cmd_setup, "notify": cmd_notify, "week": cmd_week,
-            "log": cmd_log, "status": cmd_status}
+            "log": cmd_log, "status": cmd_status, "skip": cmd_skip}
     if a[0] not in cmds:
         sys.exit(__doc__)
     try:

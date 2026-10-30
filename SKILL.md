@@ -9,9 +9,11 @@ description: 每周骑一次车的天气提醒和骑行记录。用户说"今天
 
 ## 组成
 - 脚本：本 skill 目录下的 `scripts/ride_check.py`（只用 Python 标准库）
+- 提醒卡片：`scripts/popup_ui.py`（tkinter，右上角淡入、跟随系统深浅色，显示最佳时段和逐小时天气条；没有 tkinter 就退回系统弹窗）
 - 数据目录：`~/.ride-weather/`（环境变量 `RIDE_WEATHER_HOME` 可改）
   - `config.json`：城市坐标、时段、阈值，只写要覆盖的键，其余用脚本里的 `DEFAULT_CONFIG`
   - `rides.json`：骑行记录 `[{date, note}]`
+  - `skips.json`：说了"这周不骑"的周（周一日期）
   - `ride_check.log`：每次定时检查的判断结果
 - 天气：[Open-Meteo](https://open-meteo.com) 逐小时预报 + 空气质量，免 key
 - 定时任务：每天晚上跑 `notify`（装法见 README）
@@ -24,7 +26,9 @@ description: 每周骑一次车的天气提醒和骑行记录。用户说"今天
 | `log [YYYY-MM-DD] [备注]` | 记一次骑行，日期省略=今天，同一天重复记会覆盖 |
 | `week` | 今天起 7 天每天能不能骑、最佳时段 |
 | `status` | 本周骑了没、连续达标周数、最近 10 次 |
-| `notify` | 定时任务用；手动跑可测试 |
+| `notify` | 定时任务用 |
+| `notify --preview` | 不管骑没骑都弹一下卡片，看效果 |
+| `skip` | 这周不骑了，本周不再提醒（卡片上「这周不骑了」按钮也是这个） |
 
 ## "适合骑车"怎么判断
 在可骑时段里（默认周末 9–18 点，工作日 17–19 点）找**连续 ≥3 小时**每小时都满足：
@@ -36,4 +40,6 @@ description: 每周骑一次车的天气提醒和骑行记录。用户说"今天
 - **用户说骑了**：跑 `log`，备注写里程/路线/感受（用户说了才写），再跑 `status` 告诉用户本周达标了、连续几周。
 - **问哪天能骑**：跑 `week`，用一两句话给建议（哪天最好、几点），不要把整张表原样丢过去。
 - **改标准**：改 `~/.ride-weather/config.json`（只写要改的键），再跑 `week` 确认效果。
+- **用户说这周不骑了 / 别提醒了**：跑 `skip`。
+- **想看提醒长什么样**：跑 `notify --preview`。
 - **没收到提醒**：先看 `ride_check.log`，再查定时任务（Windows `schtasks /query /tn RideWeather /v`，mac/Linux `crontab -l`）。

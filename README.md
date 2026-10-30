@@ -6,6 +6,10 @@
 - 跟 Claude 说「今天骑车了」就记一笔，统计连续达标了几周
 - 问「这周哪天能骑」，看未来 7 天每天的最佳时段
 
+![提醒卡片](docs/card.png)
+
+提醒是一张右上角的小卡片：最佳时段、体感/风/降水/PM2.5，逐小时天气条（绿=适合，红=雨/冷/热/风大/雾霾），跟随系统深浅色。点「这周不骑了」本周就不再提醒。
+
 ```
 西安  本周还没骑
 10-31 周六(明天)  ✅ 10:00–14:00  体感11~13° 风6km/h   [体感9~13° 降水概率最高78% 风13km/h PM2.5最高91]
@@ -57,7 +61,7 @@ schtasks /create /tn RideWeather /sc daily /st 20:30 /f /tr "\"<pythonw.exe 路�
 30 20 * * * /usr/bin/env python3 ~/.claude/skills/ride-weather/scripts/ride_check.py notify
 ```
 
-弹窗方式：Windows 用置顶对话框（PowerShell toast 在 Windows 11 上经常被静默丢弃），macOS 用 `osascript`，Linux 用 `notify-send`。
+卡片用 Python 自带的 tkinter 画（不走系统通知，Windows 11 上 PowerShell toast 经常被静默丢弃）。没有 tkinter 时退回系统弹窗：Windows MessageBox、macOS `osascript`、Linux `notify-send`。
 
 ## 自定义
 
@@ -81,6 +85,8 @@ ride_check.py week              未来 7 天能不能骑
 ride_check.py log [日期] [备注]  记一次骑行
 ride_check.py status            本周骑了没、连续达标周数
 ride_check.py notify            定时任务用
+ride_check.py notify --preview  弹一下卡片看效果
+ride_check.py skip              这周不骑了
 ```
 
 装好之后直接跟 Claude 说话就行：「今天骑车了，30 公里」「这周哪天能骑」「风的标准放宽点」。
