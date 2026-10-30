@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.ride-weather/
+config.json
+rides.json
+*.log
