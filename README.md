@@ -34,7 +34,7 @@
 
 ```bash
 # 1. 放进 Claude Code 的 skills 目录
-git clone https://github.com/<你的用户名>/ride-weather ~/.claude/skills/ride-weather
+git clone https://github.com/jasonkyo/ride-weather ~/.claude/skills/ride-weather
 
 # 2. 设置城市（中文英文都行）
 python ~/.claude/skills/ride-weather/scripts/ride_check.py setup 西安
