@@ -15,12 +15,14 @@ LIGHT = {
     "accent": "#1A7F37", "soft": "#DAFBE1", "chip": "#F6F8FA",
     "bad_bg": "#FFEBE9", "bad_fg": "#CF222E",
     "btn": "#1F883D", "btn_hover": "#1A7F37", "btn_fg": "#FFFFFF", "ghost_hover": "#F3F4F6",
+    "ok_bar": "#4AC26B", "best_bar": "#1A7F37", "yel_bar": "#E3B341", "red_bar": "#E5534B", "bar_txt": "#1F2328",
 }
 DARK = {
     "bg": "#161B22", "border": "#30363D", "fg": "#E6EDF3", "muted": "#8D96A0",
     "accent": "#3FB950", "soft": "#1B3A26", "chip": "#21262D",
     "bad_bg": "#3D1D20", "bad_fg": "#FF7B72",
     "btn": "#238636", "btn_hover": "#2EA043", "btn_fg": "#FFFFFF", "ghost_hover": "#21262D",
+    "ok_bar": "#2E7D46", "best_bar": "#3FB950", "yel_bar": "#D29922", "red_bar": "#DA3633", "bar_txt": "#0D1117",
 }
 
 
@@ -56,7 +58,7 @@ def rounded(cv, x1, y1, x2, y2, r, **kw):
     return cv.create_polygon(pts, smooth=True, **kw)
 
 
-def show(card):
+def show(card, scale=None):
     import tkinter as tk
     import tkinter.font as tkfont
 
@@ -73,7 +75,10 @@ def show(card):
     root.withdraw()
     root.overrideredirect(True)
     root.attributes("-topmost", True)
-    s = root.winfo_fpixels("1i") / 96
+    # 整体缩放：config.json 的 ui_scale（本人 5120 宽屏看不清，设 2.5）；卡片比屏幕高时自动缩小重画
+    if scale is None:
+        scale = float(ride_check.load_config().get("ui_scale", 1) or 1)
+    s = root.winfo_fpixels("1i") / 96 * scale
 
     def px(v):
         return int(round(v * s))
@@ -81,7 +86,7 @@ def show(card):
     fam = pick_family(tkfont)
 
     def F(size, weight="normal"):
-        return (fam, size, weight)
+        return (fam, int(round(size * scale)), weight)
 
     W = px(360)  # 内容宽
     outer = tk.Frame(root, bg=c["border"], padx=1, pady=1)
@@ -119,16 +124,56 @@ def show(card):
     x.bind("<Enter>", lambda e: x.config(fg=c["fg"]))
     x.bind("<Leave>", lambda e: x.config(fg=c["muted"]))
 
-    # 最佳时段
-    big = tk.Frame(card_f, bg=c["bg"], pady=px(10))
+    def section(text):
+        tk.Label(card_f, text=text, font=F(8, "bold"), bg=c["bg"], fg=c["muted"]).pack(anchor="w", pady=(px(8), 0))
+        tk.Frame(card_f, bg=c["border"], height=1, width=W).pack(fill="x", pady=(px(2), px(4)))
+
+    # ① 今天：做了什么（本人 11-01：要有昨晚提醒、今天完成的部分）
+    section(card.get("today_title", "今天"))
+    today_box = tk.Frame(card_f, bg=c["bg"])
+    today_box.pack(fill="x")
+    today_lbls = []
+    for line in card.get("today_lines") or []:
+        done = line.startswith("✅")
+        lb = tk.Label(today_box, text=line, font=F(10, "bold" if done else "normal"), bg=c["bg"],
+                      fg=c["accent"] if done else c["fg"], wraplength=W, justify="left")
+        lb.pack(anchor="w")
+        today_lbls.append(lb)
+    yrow = None
+    yplan = card.get("yday_plan") or ("ride" if card.get("yday_ask") else None)
+    if yplan:
+        yrow = tk.Frame(card_f, bg=c["chip"], padx=px(10), pady=px(6))
+        yrow.pack(fill="x", pady=(px(6), 0))
+        ylab = tk.Label(yrow, text=f"昨天计划{'骑车' if yplan == 'ride' else '练单杠'}，去了吗？",
+                        font=F(9), bg=c["chip"], fg=c["fg"])
+        ylab.pack(side="left")
+
+    # ② 明天
+    section(f"明天 {card['sub'].split('·')[-1].strip()}")
+    big = tk.Frame(card_f, bg=c["bg"], pady=px(4))
     big.pack(fill="x")
-    tk.Label(big, text=card["window"], font=F(24, "bold"), bg=c["bg"], fg=c["accent"]).pack(side="left")
-    tk.Label(big, text="  最佳时段", font=F(9), bg=c["bg"], fg=c["muted"]).pack(side="left", anchor="s", pady=px(6))
+    ok = card.get("ok", True)
+    if ok:
+        tk.Label(big, text=card["window"], font=F(24, "bold"), bg=c["bg"], fg=c["accent"]).pack(side="left")
+        tk.Label(big, text="  最佳时段", font=F(9), bg=c["bg"], fg=c["muted"]).pack(side="left", anchor="s", pady=px(6))
+    else:
+        tk.Label(big, text=card.get("reason") or "天气不行", font=F(18, "bold"), bg=c["bg"], fg=c["bad_fg"],
+                 wraplength=W, justify="left").pack(side="left")
+        tk.Label(big, text="  不建议骑", font=F(9), bg=c["bg"], fg=c["muted"]).pack(side="left", anchor="s", pady=px(4))
 
     # 指标小块
     chips = tk.Frame(card_f, bg=c["bg"])
     chips.pack(fill="x")
-    items = [("体感", card["feel"]), ("风", f"{card['wind']} km/h"), ("降水", f"{card['pp']}%")]
+    def beaufort(kmh):
+        """km/h → 风力等级（蒲福风级）。"""
+        try:
+            v = float(kmh)
+        except (TypeError, ValueError):
+            return ""
+        edges = [1, 6, 12, 20, 29, 39, 50, 62, 75, 89, 103, 118]
+        return f" · {sum(v >= e for e in edges)}级"
+
+    items = [("体感", card["feel"]), ("风", f"{card['wind']} km/h{beaufort(card['wind'])}"), ("降水", f"{card['pp']}%")]
     if card.get("pm"):
         items.append(("PM2.5", card["pm"]))
     for i, (k_, v) in enumerate(items):
@@ -138,43 +183,66 @@ def show(card):
         tk.Label(ch, text=v, font=F(10, "bold"), bg=c["chip"], fg=c["fg"]).pack(anchor="w")
 
     # 逐小时条
-    hours = card["hours"]
+    hours = card["hours"] or []
     lo, hi = card["best"]
-    H = px(70)
-    cv = tk.Canvas(card_f, width=W, height=H, bg=c["bg"], highlightthickness=0)
-    cv.pack(pady=(px(14), 0))
-    n = len(hours)
+    H = px(66)
+    cv = tk.Canvas(card_f, width=W, height=H if hours else 1, bg=c["bg"], highlightthickness=0)
+    cv.pack(pady=(px(8), 0))
+    n = max(len(hours), 1)
     cw = W / n
     gap = px(2)
+    # 本人 11-01：全天 9–20 点，绿=适合（深绿=最佳时段）、黄=勉强（小雨/风大/轻度污染）、红=不适合（大雨/冷/热/大风/重污染）
+    short = {"大雨": "雨", "小雨": "雨", "冷": "冷", "热": "热", "大风": "风", "风大": "风", "雾霾": "霾", "轻度污染": "霾"}
     for i, h in enumerate(hours):
         x1, x2 = i * cw + gap, (i + 1) * cw - gap
         mid = (x1 + x2) / 2
         if h["feel"] is not None:
             cv.create_text(mid, px(8), text=f"{h['feel']:.0f}°", font=F(8), fill=c["muted"])
-        if h["bad"]:
-            fill, txt, tc = c["bad_bg"], h["bad"][0][0], c["bad_fg"]
-        elif lo <= i < hi:
-            fill, txt, tc = c["accent"], "", ""
+        lv = h.get("level", 2 if h["bad"] else 0)
+        if lv == 2:
+            fill, txt = c["red_bar"], short.get(h["bad"][0], h["bad"][0][0])
+        elif lv == 1:
+            fill, txt = c["yel_bar"], short.get(h["bad"][0], h["bad"][0][0])
+        elif ok and lo <= i < hi:
+            fill, txt = c["best_bar"], ""
         else:
-            fill, txt, tc = c["soft"], "", ""
+            fill, txt = c["ok_bar"], ""
         rounded(cv, x1, px(18), x2, px(46), px(6), fill=fill, outline="")
         if txt:
-            cv.create_text(mid, px(32), text=txt, font=F(8, "bold"), fill=tc)
-        cv.create_text(mid, px(60), text=str(h["h"]), font=F(8), fill=c["muted"])
+            cv.create_text(mid, px(32), text=txt, font=F(8, "bold"), fill=c["bar_txt"])
+        cv.create_text(mid, px(57), text=str(h["h"]), font=F(8), fill=c["muted"])
+    if hours:  # 图例
+        lg = tk.Frame(card_f, bg=c["bg"])
+        lg.pack(anchor="w", pady=(px(2), 0))
+        for col, name in [(c["best_bar"], "最佳"), (c["ok_bar"], "适合"), (c["yel_bar"], "勉强"), (c["red_bar"], "不适合")]:
+            tk.Label(lg, text="■", font=F(9), bg=c["bg"], fg=col).pack(side="left")
+            tk.Label(lg, text=name + "  ", font=F(8), bg=c["bg"], fg=c["muted"]).pack(side="left")
 
     if card.get("warn"):
         warn = tk.Frame(card_f, bg=c["bad_bg"], padx=px(10), pady=px(6))
         warn.pack(fill="x", pady=(px(10), 0))
         tk.Label(warn, text="⚠ " + card["warn"], font=F(9, "bold"), bg=c["bad_bg"], fg=c["bad_fg"],
                  wraplength=W - px(20), justify="left").pack(anchor="w")
-    tk.Label(card_f, text=card["tail"], font=F(9), bg=c["bg"], fg=c["fg"],
-             wraplength=W, justify="left").pack(anchor="w", pady=(px(10), 0))
-    tk.Label(card_f, text="骑完跟 Claude 说一声「今天骑车了」", font=F(8), bg=c["bg"],
-             fg=c["muted"]).pack(anchor="w", pady=(px(2), 0))
+    if card.get("advice"):
+        tk.Label(card_f, text=card["advice"], font=F(10, "bold"), bg=c["bg"], fg=c["fg"],
+                 wraplength=W, justify="left").pack(anchor="w", pady=(px(8), 0))
+    if card.get("later"):
+        tk.Label(card_f, text=card["later"], font=F(9), bg=c["bg"], fg=c["muted"],
+                 wraplength=W, justify="left").pack(anchor="w", pady=(px(4), 0))
+    # ③ 本周
+    if card.get("week"):
+        section("本周进度")
+        week_lbl = tk.Label(card_f, text=card["week"], font=F(9), bg=c["bg"], fg=c["fg"], wraplength=W, justify="left")
+        week_lbl.pack(anchor="w")
+    else:  # 老格式
+        tk.Label(card_f, text=card["tail"], font=F(9), bg=c["bg"], fg=c["fg"],
+                 wraplength=W, justify="left").pack(anchor="w", pady=(px(10), 0))
+    hint = tk.Label(card_f, text="", font=F(8), bg=c["bg"], fg=c["muted"])
+    hint.pack(anchor="w", pady=(px(2), 0))
 
     # 按钮
     btns = tk.Frame(card_f, bg=c["bg"], pady=0)
-    btns.pack(fill="x", pady=(px(14), 0))
+    btns.pack(fill="x", pady=(px(10), 0))
 
     def button(parent, text, primary, cmd):
         bg = c["btn"] if primary else c["bg"]
@@ -186,14 +254,68 @@ def show(card):
         b.bind("<Leave>", lambda e: b.config(bg=bg))
         return b
 
-    def skip():
-        try:
-            ride_check.cmd_skip([card["day"]])
-        finally:
-            close()
+    today = card.get("today") or ride_check.dt.date.today().isoformat()
 
-    button(btns, f"好，{card['rel']}骑", True, close).pack(side="right")
-    button(btns, "这周不骑了", False, skip).pack(side="right", padx=(0, px(6)))
+    def mark(btn, msg):
+        btn.config(text=msg)
+        btn.unbind("<Button-1>")
+        btn.unbind("<Enter>")
+        btn.unbind("<Leave>")
+
+    def record(path, d, note, btn, msg, line):
+        """同一天重复点会覆盖，不会记两次；卡片留着看明天的天气。"""
+        try:
+            ride_check.add_record(path, ride_check.dt.date.fromisoformat(d), note)
+            mark(btn, msg)
+            if line and today_lbls and not today_lbls[0].cget("text").startswith("✅"):
+                today_lbls[0].config(text=line, fg=c["accent"], font=F(10, "bold"))
+            elif line:
+                tk.Label(today_box, text=line, font=F(10, "bold"), bg=c["bg"], fg=c["accent"]).pack(anchor="w")
+        except Exception as e:  # noqa: BLE001
+            hint.config(text=f"记录失败：{e}")
+
+    def plan_and_close(what):
+        """「明天去骑 / 明天去练」：记下计划，明晚卡片核对去没去。"""
+        try:
+            ride_check.set_plan(ride_check.dt.date.fromisoformat(card["day"]), what)
+        except Exception as e:  # noqa: BLE001
+            ride_check.log(f"记计划失败：{e!r}")
+        close()
+
+    if yrow is not None:
+        ydone = "骑了，补记" if yplan == "ride" else "练了，补记"
+        yb = button(yrow, ydone, False, lambda: None)
+        yb.bind("<Button-1>", lambda e: (record(ride_check.RIDES if yplan == "ride" else ride_check.TRAINS,
+                                                card["yday"], "卡片补记", yb, "已补记 ✅", None),
+                                         ylab.config(text="昨天已补记")))
+        yb.pack(side="right")
+
+    # 第二行：明天打算（本人 11-01：点了今天骑了/练了之后，明天去骑、明天去练都要能选；推荐的那个高亮）
+    plan_row = btns
+    if ok:
+        sug = card.get("suggest", "ride")
+        rel = card["rel"]
+        button(plan_row, f"{rel}去{'骑' if sug == 'ride' else '练'}", True,  # 推荐的放最右、绿色高亮
+               lambda: plan_and_close(sug)).pack(side="right", padx=(px(6), 0))
+        other = "train" if sug == "ride" else "ride"
+        button(plan_row, f"{rel}去{'骑' if other == 'ride' else '练'}", False,
+               lambda: plan_and_close(other)).pack(side="right", padx=(px(6), 0))
+    else:
+        button(plan_row, "知道了", True, close).pack(side="right")
+
+    # 本人 10-31：卡片同时管骑车和单杠，"这周不骑了·不再提醒"会把单杠也一起关掉，去掉；不想看直接关
+    ride_btn = button(btns, "☐ 今天骑了", False, lambda: None)
+    if card.get("rode_today"):
+        mark(ride_btn, "✅ 今天骑了")
+    else:
+        ride_btn.bind("<Button-1>", lambda e: record(ride_check.RIDES, today, "卡片上点的", ride_btn, "✅ 今天骑了", "✅ 骑车了"))
+    ride_btn.pack(side="left")
+    train_btn = button(btns, "☐ 今天练了", False, lambda: None)
+    if card.get("trained_today"):
+        mark(train_btn, "✅ 今天练了")
+    else:
+        train_btn.bind("<Button-1>", lambda e: record(ride_check.TRAINS, today, "卡片上点的", train_btn, "✅ 今天练了", "✅ 练了"))
+    train_btn.pack(side="left")
 
     # 拖动、Esc 关闭
     drag = {}
@@ -211,6 +333,10 @@ def show(card):
 
     # 右上角（右下角常被任务栏和桌面挂件挡住）、圆角、淡入
     root.update_idletasks()
+    if root.winfo_reqheight() > root.winfo_screenheight() - px(40) and scale > 0.8:
+        k = (root.winfo_screenheight() - px(40)) / root.winfo_reqheight()
+        root.destroy()
+        return show(card, scale * max(0.6, min(0.95, k)))
     w = root.winfo_reqwidth()
     root.geometry(f"+{root.winfo_screenwidth() - w - px(24)}+{px(24)}")
     if win:

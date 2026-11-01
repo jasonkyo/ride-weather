@@ -1,12 +1,17 @@
-"""每周骑一次车：查天气，本周还没骑且明天天气好就弹窗提醒。
+"""每周骑一次车：每晚弹一次，告诉你明天适不适合骑车/练单杠，以及本周骑了几次、练了几次。
+
+本周骑了几次 = rides.json（手动 log / 卡片上点「今天骑了」）∪ 训记里的骑行（苹果健康同步的 Cycling）；
+练了几次 = 训记里有非有氧动作的训练（单杠、力量）。训记可选：本机装了 xunji skill 才读，Key 从它的 SKILL.md 里取。
 
 用法：
   ride_check.py setup <城市>        设置城市（自动查坐标和时区），如 setup 西安
-  ride_check.py notify            每晚定时任务跑：本周没骑 + 明天适合 → 弹窗
+  ride_check.py notify            每晚定时任务跑：弹卡片（这周点了「不骑了」就不弹）
   ride_check.py notify --preview  不管骑没骑，弹一下看效果
   ride_check.py skip              这周不骑了，本周不再提醒
   ride_check.py week              打印今天起 7 天每天能不能骑
   ride_check.py log [日期] [备注]  记一次骑行（日期默认今天，格式 2026-10-30）
+  ride_check.py train [日期] [内容] 训记里没记的训练手动补一条
+  ride_check.py plan [日期] [ride|train]  记下要去骑车/练单杠的日期（默认明天骑车），第二天晚上卡片核对
   ride_check.py status            本周骑了没、连续达标周数、最近记录
 
 数据目录默认 ~/.ride-weather，可用环境变量 RIDE_WEATHER_HOME 改。
@@ -18,6 +23,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import time
 import urllib.parse
 import urllib.request
 
@@ -32,12 +38,15 @@ RIDES = os.path.join(DIR, "rides.json")
 LOG = os.path.join(DIR, "ride_check.log")
 CONFIG = os.path.join(DIR, "config.json")
 SKIPS = os.path.join(DIR, "skips.json")
+TRAINS = os.path.join(DIR, "trains.json")   # 训记里没记的训练，卡片上点「今天练了」补的
+PLANS = os.path.join(DIR, "plans.json")     # {日期: "ride"}，卡片上点「好，明天去骑」记下，第二天晚上核对
 
 DEFAULT_CONFIG = {
     "city": None, "lat": None, "lon": None,
     "timezone": "auto",
     "weekend_hours": [9, 18],   # 周末可骑时段
     "weekday_hours": [17, 19],  # 工作日下班后
+    "day_hours": None,          # 设了就不分工作日周末，比如 [9, 20]：卡片显示并在这段里找最佳时段
     "min_block": 3,             # 至少连续几个小时天气都行
     "rain_prob_max": 30,        # 降水概率 %
     "rain_mm_max": 0.2,         # 每小时降水量 mm
@@ -45,6 +54,10 @@ DEFAULT_CONFIG = {
     "wind_max": 25, "gust_max": 40,  # km/h
     "pm25_max": 75,             # μg/m³，超过算污染（国标轻度污染线）
     "wet_road_mm": 5,           # 出发前 12 小时累计雨量超过这个算路湿
+    # 红档（明显不适合）；黄档 = 超过上面的普通线但没到红线
+    "heavy_rain_mm": 1.0, "heavy_rain_prob": 70,
+    "wind_red": 35, "gust_red": 55,
+    "pm25_red": 115,            # 国标中度污染线
 }
 
 WEEKDAY = "一二三四五六日"
@@ -72,11 +85,29 @@ def log(msg):
         f.write(f"{dt.datetime.now():%Y-%m-%d %H:%M} {msg}\n")
 
 
-def load_rides():
-    if not os.path.exists(RIDES):
-        return []
-    with open(RIDES, encoding="utf-8") as f:
+def load_json(path, default):
+    if not os.path.exists(path):
+        return default
+    with open(path, encoding="utf-8") as f:
         return json.load(f)
+
+
+def load_rides():
+    return load_json(RIDES, [])
+
+
+def add_record(path, d, note=""):
+    """rides.json / trains.json 记一条（同一天覆盖，不会重复）。"""
+    recs = [r for r in load_json(path, []) if r["date"] != d.isoformat()]
+    recs.append({"date": d.isoformat(), "note": note})
+    recs.sort(key=lambda r: r["date"])
+    save_json(path, recs)
+
+
+def set_plan(d, what="ride"):
+    plans = load_json(PLANS, {})
+    plans[d.isoformat()] = what
+    save_json(PLANS, plans)
 
 
 def week_start(d):
@@ -86,6 +117,65 @@ def week_start(d):
 def rode_in_week(rides, d):
     ws = week_start(d)
     return [r for r in rides if week_start(dt.date.fromisoformat(r["date"])) == ws]
+
+
+XUNJI_SKILL = os.path.join(os.path.expanduser("~"), ".claude", "skills", "xunji", "SKILL.md")
+
+
+def xunji_week(day, upto, start=None):
+    """训记里 start（默认 day 所在周的周一）~ upto 的骑行日和训练日。没装训记或读失败就返回空，不影响提醒。
+    返回 (骑行日期集合, {训练日期: 训练标题})；有哪天没读到（没装、限频、断网），训练返回 None，别误报"还没练"。"""
+    import gzip
+    import re
+    rides, trains = set(), {}
+    try:
+        key = re.search(r"Bearer (xjllm_\w+)", open(XUNJI_SKILL, encoding="utf-8").read()).group(1)
+    except (OSError, AttributeError):
+        return rides, None
+    failed = False
+    def fetch(d):
+        """同一天 15 秒内只能读一次；别的程序（日程总结、复盘弹窗）刚读过时会回 too frequent，按提示等一下再读。"""
+        for _ in range(3):
+            req = urllib.request.Request(
+                "https://trains.xunjiapp.cn/api_trains_for_llm_v2",
+                json.dumps({"schema_version": "train_open_api_v2", "datestr": d.isoformat(),
+                            "include_full_data": False}).encode(),
+                {"Authorization": f"Bearer {key}", "Content-Type": "application/json", "Accept-Encoding": "gzip"})
+            raw = urllib.request.urlopen(req, timeout=15).read()
+            res = json.loads(gzip.decompress(raw) if raw[:2] == b"\x1f\x8b" else raw).get("res")
+            if isinstance(res, dict):
+                return res
+            wait = re.search(r"retry after (\d+)", str(res))
+            if not wait:
+                break
+            time.sleep(min(int(wait.group(1)), 20) + 1)
+        raise RuntimeError(str(res)[:80])  # 限频等错误时 res 是一句文字
+
+    # 本机有 daily-summary 的训记统一缓存就走缓存（和日程总结、复盘弹窗共用，避免同时请求被限频）；没有就直接请求
+    cache = None
+    cache_dir = os.path.join(os.path.expanduser("~"), ".claude", "skills", "daily-summary", "scripts")
+    if os.path.exists(os.path.join(cache_dir, "xunji_cache.py")):
+        sys.path.insert(0, cache_dir)
+        try:
+            import xunji_cache as cache
+        except Exception:  # noqa: BLE001
+            cache = None
+
+    d = start or week_start(day)
+    while d <= upto:
+        try:
+            res = {"trains": cache.trains(d)} if cache else fetch(d)
+            for t in res.get("trains") or []:
+                moves = t.get("movements") or []
+                if any(m.get("name") == "Cycling" or "骑" in (m.get("name") or "") for m in moves):
+                    rides.add(d)
+                if any(m.get("exetype") != "cardio" for m in moves):  # 单杠、力量（走路骑车都是 cardio）
+                    trains.setdefault(d, t.get("title") or "训练")
+        except Exception as e:  # noqa: BLE001
+            failed = True
+            log(f"训记 {d} 读取失败：{e}")
+        d += dt.timedelta(days=1)
+    return rides, (None if failed else trains)
 
 
 def get_json(url):
@@ -115,24 +205,36 @@ def fetch_forecast(cfg):
     } for i, t in enumerate(h["time"])]
 
 
-def hour_problems(x, cfg):
-    bad = []
-    if x["pp"] > cfg["rain_prob_max"] or x["mm"] > cfg["rain_mm_max"]:
-        bad.append("雨")
+def hour_level(x, cfg):
+    """逐小时分三档（本人 11-01 要求）：0 绿=适合，1 黄=勉强（小雨、风大、轻度污染），2 红=不适合（大雨、冷、热、大风、重污染）。
+    返回 (档位, [原因])。黄、红都算"不适合"，只是红更严重。"""
+    red, yellow = [], []
+    if x["mm"] > cfg["heavy_rain_mm"] or x["pp"] >= cfg["heavy_rain_prob"]:
+        red.append("大雨")
+    elif x["pp"] > cfg["rain_prob_max"] or x["mm"] > cfg["rain_mm_max"]:
+        yellow.append("小雨")
     if x["feel"] is not None and x["feel"] > cfg["feel_max"]:
-        bad.append("热")
+        red.append("热")
     if x["feel"] is not None and x["feel"] < cfg["feel_min"]:
-        bad.append("冷")
-    if x["wind"] > cfg["wind_max"] or x["gust"] > cfg["gust_max"]:
-        bad.append("风大")
-    if x["pm"] is not None and x["pm"] > cfg["pm25_max"]:
-        bad.append("雾霾")
-    return bad
+        red.append("冷")
+    if x["wind"] > cfg["wind_red"] or x["gust"] > cfg["gust_red"]:
+        red.append("大风")
+    elif x["wind"] > cfg["wind_max"] or x["gust"] > cfg["gust_max"]:
+        yellow.append("风大")
+    if x["pm"] is not None and x["pm"] > cfg["pm25_red"]:
+        red.append("雾霾")
+    elif x["pm"] is not None and x["pm"] > cfg["pm25_max"]:
+        yellow.append("轻度污染")
+    return (2 if red else 1 if yellow else 0), red + yellow
+
+
+def hour_problems(x, cfg):
+    return hour_level(x, cfg)[1]
 
 
 def judge_day(day, hours, cfg):
-    """看这一天可骑时段里有没有足够长的连续好天气。"""
-    lo, hi = cfg["weekend_hours"] if day.weekday() >= 5 else cfg["weekday_hours"]
+    """看这一天可骑时段里有没有足够长的连续好天气（只算绿档小时）。"""
+    lo, hi = cfg.get("day_hours") or (cfg["weekend_hours"] if day.weekday() >= 5 else cfg["weekday_hours"])
     seg = [x for x in hours if x["t"].date() == day and lo <= x["t"].hour < hi]
     if not seg:
         return {"ok": False, "reason": "没有预报"}
@@ -141,11 +243,20 @@ def judge_day(day, hours, cfg):
     summary = (f"体感{min(feel):.0f}~{max(feel):.0f}° 降水概率最高{max(x['pp'] for x in seg)}% "
                f"风{max(x['wind'] for x in seg):.0f}km/h"
                + (f" PM2.5最高{max(pms):.0f}" if pms else ""))
+    levels = [hour_level(x, cfg) for x in seg]
+    probs = [p for _, p in levels]
+    hour_bars = [{"h": x["t"].hour, "feel": x["feel"], "bad": p, "level": lv}
+                 for x, (lv, p) in zip(seg, levels)]
+    # 不适合的天也给弹窗画图用：全天指标 + 逐小时
+    whole = {"summary": summary, "best": [0, 0],
+             "feel": f"{min(feel):.0f}~{max(feel):.0f}°" if feel else "-",
+             "wind": f"{max(x['wind'] for x in seg):.0f}", "pp": max(x["pp"] for x in seg),
+             "pm": f"{max(pms):.0f}" if pms else None,
+             "hours": hour_bars}
     start = dt.datetime.combine(day, dt.time(lo))
     rain12 = sum(x["mm"] for x in hours if start - dt.timedelta(hours=12) <= x["t"] < start)
     if rain12 > cfg["wet_road_mm"]:
-        return {"ok": False, "reason": f"之前下雨{rain12:.0f}mm，路湿", "summary": summary}
-    probs = [hour_problems(x, cfg) for x in seg]
+        return {"ok": False, "reason": f"之前下雨{rain12:.0f}mm，路湿", **whole}
     best, cur = (0, 0), None
     for i, p in enumerate(probs + [["end"]]):
         if not p:
@@ -156,7 +267,7 @@ def judge_day(day, hours, cfg):
             cur = None
     if best[1] - best[0] < cfg["min_block"]:
         reasons = sorted({b for p in probs for b in p})
-        return {"ok": False, "reason": "、".join(reasons) or "好天气时段太短", "summary": summary}
+        return {"ok": False, "reason": "、".join(reasons) or "好天气时段太短", **whole}
     w = seg[best[0]:best[1]]
     wpm = [x["pm"] for x in w if x["pm"] is not None]
     # 好时段一结束就下雨的话要提醒：别骑远了回不来
@@ -176,7 +287,7 @@ def judge_day(day, hours, cfg):
             "pp": max(x["pp"] for x in w),
             "pm": f"{max(wpm):.0f}" if wpm else None,
             "best": list(best),
-            "hours": [{"h": x["t"].hour, "feel": x["feel"], "bad": p} for x, p in zip(seg, probs)]}
+            "hours": hour_bars}
 
 
 def day_label(d, today):
@@ -262,69 +373,134 @@ def cmd_skip(args):
 
 
 def cmd_notify(args):
-    """--preview：不管本周骑没骑，弹一下看效果（明天不适合就挑 7 天内第一个好天）。"""
+    """每晚定时提醒（本人 10-31 要求）：不管明天天气好坏都弹，给出明天能不能骑的建议 + 本周已骑几次，
+    好让周五周六也记得这周骑没骑、临时决定明天去不去。只有点了「这周不骑了」的周不弹。
+    --preview：无视「这周不骑了」，弹一下看效果。"""
     preview = "--preview" in args
     cfg = load_config()
     today = dt.date.today()
-    tomorrow = today + dt.timedelta(days=1)
-    if not preview:
-        if rode_in_week(load_rides(), tomorrow):
-            log("本周已骑，不提醒")
-            return
-        if week_start(tomorrow).isoformat() in load_skips():
-            log("这周说了不骑，不提醒")
-            return
+    day = today + dt.timedelta(days=1)
+    if not preview and week_start(day).isoformat() in load_skips():
+        log("这周说了不骑，不提醒")
+        return
     hours = fetch_forecast(cfg)
-    day, j = tomorrow, judge_day(tomorrow, hours, cfg)
-    if not j["ok"]:
-        if not preview:
-            log(f"明天不适合：{j['reason']}")
-            return
-        for i in range(7):
-            day = today + dt.timedelta(days=i)
-            j = judge_day(day, hours, cfg)
-            if j["ok"]:
-                break
-        else:
-            print("7 天内都没有适合骑车的天")
-            return
-    rel = {0: "今天", 1: "明天", 2: "后天"}.get((day - today).days, f"周{WEEKDAY[day.weekday()]}")
-    others = []
+    j = judge_day(day, hours, cfg)
+    rel = "明天"
+    wd = f"周{WEEKDAY[day.weekday()]}"
+
+    others = []  # 明天之后、本周之内还能骑的天
     d = day + dt.timedelta(days=1)
     while week_start(d) == week_start(day):
         jj = judge_day(d, hours, cfg)
         if jj["ok"]:
             others.append(f"周{WEEKDAY[d.weekday()]} {jj['window']}")
         d += dt.timedelta(days=1)
-    if day.weekday() == 6:
-        tail = f"{rel}是本周最后一天，这周还没骑！"
-    elif others:
-        tail = "本周后面也行：" + "、".join(others)
+
+    # 本人 11-01：卡片分三块——今天做了什么（打卡）/ 明天建议 / 本周进度。
+    # 本周按「今天所在的周」算（以前按明天算，周日晚上会把今天漏掉）；昨天有计划没记录的，也给补记的机会。
+    yday = today - dt.timedelta(days=1)
+    ws = week_start(today)
+    xr, xt = xunji_week(today, today, start=min(ws, yday))
+    ride_set = {dt.date.fromisoformat(r["date"]) for r in load_rides()} | xr
+    manual_t = {dt.date.fromisoformat(r["date"]): (r.get("note") or "训练") for r in load_json(TRAINS, [])}
+    train_map = dict(manual_t)
+    if xt:
+        train_map.update(xt)
+    plans = load_json(PLANS, {})
+
+    def wds(ds):
+        return "、".join(f"周{WEEKDAY[x.weekday()]}" for x in ds)
+
+    def wd_short(ds):
+        return "、".join(WEEKDAY[x.weekday()] for x in ds)
+
+    rode_today, trained_today = today in ride_set, train_map.get(today)
+    # ① 今天
+    today_lines = []
+    if rode_today:
+        today_lines.append("✅ 骑车了")
+    if trained_today:
+        today_lines.append(f"✅ 练了：{trained_today}")
+    if not today_lines:
+        today_lines.append("还没记录骑车或训练" + ("（训记暂时没读到）" if xt is None and os.path.exists(XUNJI_SKILL) else ""))
+    tp = plans.get(today.isoformat())
+    if tp == "ride" and not rode_today:
+        today_lines.append("昨晚计划今天骑车，还没记录——骑了就点「今天骑了」")
+    if tp == "train" and not trained_today:
+        today_lines.append("昨晚计划今天练单杠，还没记录——练了就点「今天练了」")
+    yp = plans.get(yday.isoformat())
+    yday_plan = yp if (yp == "ride" and yday not in ride_set) or (yp == "train" and yday not in train_map) else None
+    # ③ 本周（今天所在的周）
+    week_rides = sorted(d for d in ride_set if ws <= d <= today)
+    week_trains = sorted(d for d in train_map if ws <= d <= today)
+    head = "本周小结" if today.weekday() == 6 else "本周"
+    week = (f"{head}：" + (f"骑{len(week_rides)}次（{wd_short(week_rides)}）✅" if week_rides else "还没骑")
+            + "  " + (f"练{len(week_trains)}次（{wd_short(week_trains)}）" if week_trains else "还没练单杠"))
+    if today.weekday() == 6:
+        week += "\n明天开始新的一周"
+    # ② 明天建议（户外单杠对天气的要求和骑车差不多）
+    rides_left = not week_rides or today.weekday() == 6  # 周日晚上：明天是新的一周，骑车次数清零
+    if not j["ok"]:
+        advice = "明天不太适合户外，骑车和单杠都先缓缓"
+    elif trained_today:
+        advice = f"今天练了{trained_today}，明天去骑车，单杠歇一天"
+    elif rode_today:
+        advice = "今天骑过了，明天适合练单杠"
+    elif rides_left and day.weekday() == 6:
+        advice = "明天是本周最后一天，抓住机会骑一趟"
+    elif rides_left:
+        advice = "明天骑车、练单杠都合适，优先骑车"
     else:
-        tail = f"本周后面天气都不太行，就{rel}吧"
-    body = (f"{cfg['city']} {rel} 周{WEEKDAY[day.weekday()]} {j['window']} 适合骑车\n"
-            f"{j['detail']}（全天 {j['summary']}）\n\n{tail}\n\n"
-            "骑完跟 Claude 说一声「今天骑车了」")
+        advice = "本周骑车已达标，明天可以练单杠，或者再骑一趟"
+    later = ("本周后面适合户外：" + "、".join(others)) if others else (
+        "" if day.weekday() == 6 else "本周后面天气也都不太行")
+
+    title = f"{rel}适合骑车·练单杠" if j["ok"] else f"{rel}不适合骑车·练单杠"
+    tail = f"{week}\n{advice}" + (f"\n{later}" if later else "")
+    body = (f"今天：{'；'.join(today_lines)}\n\n{cfg['city']} {rel} {wd}："
+            + (f"{j['window']} {j['detail']}" if j["ok"] else j.get("reason", "")) + f"\n\n{tail}")
     popup({
-        "title": f"{rel}适合骑车", "body": body, "rel": rel,
-        "sub": f"{cfg['city']} · {day.month}月{day.day}日 周{WEEKDAY[day.weekday()]}",
-        "window": j["window"], "feel": j["feel"], "wind": j["wind"], "pp": j["pp"], "pm": j["pm"],
-        "hours": j["hours"], "best": j["best"], "tail": tail, "day": day.isoformat(),
-        "warn": j["warn"],
+        "title": title, "body": body, "ok": j["ok"], "rel": rel, "reason": j.get("reason", ""),
+        "sub": f"{cfg['city']} · {day.month}月{day.day}日 {wd}",
+        "window": j.get("window", ""), "feel": j.get("feel", "-"), "wind": j.get("wind", "-"),
+        "pp": j.get("pp", "-"), "pm": j.get("pm"), "hours": j.get("hours", []), "best": j.get("best", [0, 0]),
+        "day": day.isoformat(), "warn": j.get("warn"), "today": today.isoformat(), "yday": yday.isoformat(),
+        "today_title": f"今天 {today.month}月{today.day}日 周{WEEKDAY[today.weekday()]}",
+        "today_lines": today_lines, "rode_today": rode_today, "trained_today": bool(trained_today),
+        "yday_plan": yday_plan, "advice": advice, "week": week, "later": later,
+        # 右下角推荐哪个：今天骑了没练 → 明天去练；其余 → 明天去骑
+        "suggest": "train" if (rode_today and not trained_today) or (not rides_left and not trained_today) else "ride",
+        "tail": tail,
     })
     if not preview:
-        log(f"已提醒：{rel} {j['window']} {j['detail']}")
+        log(f"已提醒：{title} {j.get('window') or j.get('reason', '')}；{status}")
+
+
+def _date_note(args):
+    has_date = bool(args) and args[0][:2] == "20"
+    d = dt.date.fromisoformat(args[0]) if has_date else dt.date.today()
+    return d, " ".join(args[1:] if has_date else args)
 
 
 def cmd_log(args):
-    has_date = bool(args) and args[0][:2] == "20"
-    d = dt.date.fromisoformat(args[0]) if has_date else dt.date.today()
-    note = " ".join(args[1:] if has_date else args)
-    rides = [r for r in load_rides() if r["date"] != d.isoformat()]
-    rides.append({"date": d.isoformat(), "note": note})
-    rides.sort(key=lambda r: r["date"])
-    save_json(RIDES, rides)
-    print(f"已记录 {d} 周{WEEKDAY[d.weekday()]} {note}")
+    d, note = _date_note(args)
+    add_record(RIDES, d, note)
+    print(f"已记录骑行 {d} 周{WEEKDAY[d.weekday()]} {note}")
+
+
+def cmd_train(args):
+    """训记里没记的训练手动补一条：train [日期] [内容]"""
+    d, note = _date_note(args)
+    add_record(TRAINS, d, note or "训练")
+    print(f"已记录训练 {d} 周{WEEKDAY[d.weekday()]} {note}")
+
+
+def cmd_plan(args):
+    """记下明天（或指定日期）要去骑车/练单杠：plan [日期] [ride|train]"""
+    what = args.pop() if args and args[-1] in ("ride", "train") else "ride"
+    d = dt.date.fromisoformat(args[0]) if args else dt.date.today() + dt.timedelta(days=1)
+    set_plan(d, what)
+    print(f"已记下计划：{d} 周{WEEKDAY[d.weekday()]} {'骑车' if what == 'ride' else '练单杠'}")
 
 
 def cmd_status(args):
@@ -345,7 +521,7 @@ def cmd_status(args):
 if __name__ == "__main__":
     a = sys.argv[1:] or ["week"]
     cmds = {"setup": cmd_setup, "notify": cmd_notify, "week": cmd_week,
-            "log": cmd_log, "status": cmd_status, "skip": cmd_skip}
+            "log": cmd_log, "train": cmd_train, "plan": cmd_plan, "status": cmd_status, "skip": cmd_skip}
     if a[0] not in cmds:
         sys.exit(__doc__)
     try:
